@@ -11,22 +11,26 @@ from PIL import Image
 from typing import List
 from diffusers import (
     FluxPipeline,
-    FluxImg2ImgPipeline
+    FluxPriorReduxPipeline,
 )
 from torchvision import transforms
 from transformers import CLIPImageProcessor
-from diffusers.pipelines.stable_diffusion.safety_checker import (
-    StableDiffusionSafetyChecker
-)
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+
+from condition import inputs_to_conditions
+from condition_reweighting_attention_processor import ConditionReweightingAttentionProcessor
+import monkey_patch
 
 MAX_IMAGE_SIZE = 1440
-MODEL_CACHE = "FLUX.1-dev"
-SAFETY_CACHE = "safety-cache"
-FEATURE_EXTRACTOR = "/src/feature-extractor"
-SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
-MODEL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
+DEV_CACHE = "./FLUX.1-dev"
+SCHNELL_CACHE = "./FLUX.1-schnell"
+DEV_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
+SCHNELL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
+REDUX_CACHE = "./FLUX.1-Redux"
+REDUX_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-Redux-dev/model.tar"
 
 ASPECT_RATIOS = {
+    "1:1_small": (512, 512),
     "1:1": (1024, 1024),
     "16:9": (1344, 768),
     "21:9": (1536, 640),
@@ -40,6 +44,7 @@ ASPECT_RATIOS = {
     "9:21": (640, 1536),
 }
 
+
 def download_weights(url, dest):
     start = time.time()
     print("downloading url: ", url)
@@ -47,49 +52,45 @@ def download_weights(url, dest):
     subprocess.check_call(["pget", "-xf", url, dest], close_fds=False)
     print("downloading took: ", time.time() - start)
 
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+WEIGHT_DTYPE = torch.bfloat16
+
+
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
 
-        print("Loading safety checker...")
-        if not os.path.exists(SAFETY_CACHE):
-            download_weights(SAFETY_URL, SAFETY_CACHE)
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-            SAFETY_CACHE, torch_dtype=torch.float16
-        ).to("cuda")
-        self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
+        print("Loading Flux Pipeline")
+        if not os.path.exists(self.MODEL_CACHE):
+            print(">>> flux weights do not exist")
+            download_weights(self.MODEL_URL, ".")
+        else:
+            print(">>> flux weights exist: os.listdir(self.MODEL_CACHE)")
 
-        print("Loading Flux txt2img Pipeline")
-        if not os.path.exists(MODEL_CACHE):
-            download_weights(MODEL_URL, '.')
-        self.txt2img_pipe = FluxPipeline.from_pretrained(
-            MODEL_CACHE,
-            torch_dtype=torch.bfloat16,
-            cache_dir=MODEL_CACHE
+        self.pipe = FluxPipeline.from_pretrained(
+            self.MODEL_CACHE,
+            torch_dtype=WEIGHT_DTYPE,
+            local_files_only=True,
         ).to("cuda")
+        monkey_patch.monkey_patch_pipeline(self.pipe)
+        self.pipe.transformer.set_attn_processor(ConditionReweightingAttentionProcessor())
 
-        print("Loading Flux img2img pipeline")
-        self.img2img_pipe = FluxImg2ImgPipeline(
-            transformer=self.txt2img_pipe.transformer,
-            scheduler=self.txt2img_pipe.scheduler,
-            vae=self.txt2img_pipe.vae,
-            text_encoder=self.txt2img_pipe.text_encoder,
-            text_encoder_2=self.txt2img_pipe.text_encoder_2,
-            tokenizer=self.txt2img_pipe.tokenizer,
-            tokenizer_2=self.txt2img_pipe.tokenizer_2,
-        ).to("cuda")
+        if not os.path.exists(REDUX_CACHE):
+            print(">>> redux weights do not exist")
+            download_weights(REDUX_URL, REDUX_CACHE)
+        else:
+            print(">>> redux weights exist: os.listdir(REDUX_CACHE)")
+        self.pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
+            REDUX_CACHE,
+            tokenizer=self.pipe.tokenizer,
+            text_encoder=self.pipe.text_encoder,
+            tokenizer_2=self.pipe.tokenizer_2,
+            text_encoder_2=self.pipe.text_encoder_2,
+            local_files_only=True,
+        ).to(DEVICE)
         print("setup took: ", time.time() - start)
-
-    @torch.amp.autocast('cuda')
-    def run_safety_checker(self, image):
-        safety_checker_input = self.feature_extractor(image, return_tensors="pt").to("cuda")
-        np_image = [np.array(val) for val in image]
-        image, has_nsfw_concept = self.safety_checker(
-            images=np_image,
-            clip_input=safety_checker_input.pixel_values.to(torch.float16),
-        )
-        return image, has_nsfw_concept
 
     def aspect_ratio_to_width_height(self, aspect_ratio: str) -> tuple[int, int]:
         return ASPECT_RATIOS[aspect_ratio]
@@ -112,19 +113,18 @@ class Predictor(BasePredictor):
     @torch.inference_mode()
     def predict(
         self,
-        prompt: str = Input(description="Prompt for generated image"),
-        aspect_ratio: str = Input(
-            description="Aspect ratio for the generated image",
-            choices=list(ASPECT_RATIOS.keys()),
-            default="1:1"
-        ),
-        image: Path = Input(
-            description="Input image for image to image mode. The aspect ratio of your output will match this image",
+        prompt: str = Input(description="First prompt for generated image", default=None),
+        prompt_2: str = Input(description="Second prompt for generated image", default=None),
+        redux: Path = Input(
+            description="First Redux image.",
             default=None,
         ),
-        prompt_strength: float = Input(
-            description="Prompt strength (or denoising strength) when using image to image. 1.0 corresponds to full destruction of information in image.",
-            ge=0,le=1,default=0.8,
+        redux_2: Path = Input(
+            description="Second Redux image.",
+            default=None,
+        ),
+        aspect_ratio: str = Input(
+            description="Aspect ratio for the generated image", choices=list(ASPECT_RATIOS.keys()), default="1:1"
         ),
         num_outputs: int = Input(
             description="Number of images to output.",
@@ -134,11 +134,15 @@ class Predictor(BasePredictor):
         ),
         num_inference_steps: int = Input(
             description="Number of inference steps",
-            ge=1,le=50,default=28,
+            ge=1,
+            le=50,
+            default=28,
         ),
         guidance_scale: float = Input(
             description="Guidance scale for the diffusion process",
-            ge=0,le=10,default=3.5,
+            ge=0,
+            le=10,
+            default=3.5,
         ),
         seed: int = Input(description="Random seed. Set for reproducible generation", default=None),
         output_format: str = Input(
@@ -152,82 +156,150 @@ class Predictor(BasePredictor):
             ge=0,
             le=100,
         ),
-        disable_safety_checker: bool = Input(
-            description="Disable safety checker for generated images. This feature is only available through the API. See [https://replicate.com/docs/how-does-replicate-work#safety](https://replicate.com/docs/how-does-replicate-work#safety)",
-            default=False,
-        ),
+        prompt_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
+        prompt_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
+        prompt_2_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
+        prompt_2_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
+        redux_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
+        redux_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
+        redux_2_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
+        redux_2_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         if seed is None:
             seed = int.from_bytes(os.urandom(2), "big")
         print(f"Using seed: {seed}")
 
-        width, height = self.aspect_ratio_to_width_height(aspect_ratio)
-        max_sequence_length=512
-
-        flux_kwargs = {"width": width, "height": height}
-        print(f"Prompt: {prompt}")
-        device = self.txt2img_pipe.device
-
-        if image:
-            pipe = self.img2img_pipe
-            print("img2img mode")
-            init_image = self.get_image(image)
-            width = init_image.shape[-1]
-            height = init_image.shape[-2]
-            print(f"Input image size: {width}x{height}")
-            # Calculate the scaling factor if the image exceeds MAX_IMAGE_SIZE
-            scale = min(MAX_IMAGE_SIZE / width, MAX_IMAGE_SIZE / height, 1)
-            if scale < 1:
-                width = int(width * scale)
-                height = int(height * scale)
-                print(f"Scaling image down to {width}x{height}")
-
-            # Round image width and height to nearest multiple of 16
-            width = self.make_multiple_of_16(width)
-            height = self.make_multiple_of_16(height)
-            print(f"Input image size set to: {width}x{height}")
-            # Resize
-            init_image = init_image.to(device)
-            init_image = torch.nn.functional.interpolate(init_image, (height, width))
-            init_image = init_image.to(torch.bfloat16)
-            # Set params
-            flux_kwargs["image"] = init_image
-            flux_kwargs["strength"] = prompt_strength
-        else:
-            print("txt2img mode")
-            pipe = self.txt2img_pipe
-
         generator = torch.Generator("cuda").manual_seed(seed)
 
+        prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs = self.generate_embeddings(
+            prompt,
+            prompt_2,
+            redux,
+            redux_2,
+            prompt_single_strengths,
+            prompt_double_strengths,
+            prompt_2_single_strengths,
+            prompt_2_double_strengths,
+            redux_single_strengths,
+            redux_double_strengths,
+            redux_2_single_strengths,
+            redux_2_double_strengths,
+        )
+
+        width, height = self.aspect_ratio_to_width_height(aspect_ratio)
+        max_sequence_length = 512
+
+        flux_kwargs = {
+            "width": width,
+            "height": height,
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "joint_attention_kwargs": joint_attention_kwargs,
+        }
         common_args = {
-            "prompt": [prompt] * num_outputs,
             "guidance_scale": guidance_scale,
             "generator": generator,
             "num_inference_steps": num_inference_steps,
+            "num_images_per_prompt": num_outputs,
             "max_sequence_length": max_sequence_length,
-            "output_type": "pil"
+            "output_type": "pil",
         }
 
-        output = pipe(**common_args, **flux_kwargs)
-
-        if not disable_safety_checker:
-            _, has_nsfw_content = self.run_safety_checker(output.images)
+        output = self.pipe(**common_args, **flux_kwargs)
 
         output_paths = []
         for i, image in enumerate(output.images):
-            if not disable_safety_checker and has_nsfw_content[i]:
-                print(f"NSFW content detected in image {i}")
-                continue
-            output_path = f"/tmp/out-{i}.{output_format}"
-            if output_format != 'png':
+            output_path = f"./out-{i}.{output_format}"
+            if output_format != "png":
                 image.save(output_path, quality=output_quality, optimize=True)
             else:
                 image.save(output_path)
             output_paths.append(Path(output_path))
 
-        if len(output_paths) == 0:
-            raise Exception("NSFW content detected. Try running it again, or try a different prompt.")
-
         return output_paths
-    
+
+    def generate_embeddings(
+        self,
+        prompt,
+        prompt_2,
+        redux,
+        redux_2,
+        prompt_single_strengths,
+        prompt_double_strengths,
+        prompt_2_single_strengths,
+        prompt_2_double_strengths,
+        redux_single_strengths,
+        redux_double_strengths,
+        redux_2_single_strengths,
+        redux_2_double_strengths,
+    ):
+        conditions = inputs_to_conditions(
+            prompt,
+            prompt_2,
+            redux,
+            redux_2,
+            prompt_single_strengths,
+            prompt_double_strengths,
+            prompt_2_single_strengths,
+            prompt_2_double_strengths,
+            redux_single_strengths,
+            redux_double_strengths,
+            redux_2_single_strengths,
+            redux_2_double_strengths,
+        )
+
+        embeddings_list = []
+
+        current_index = 0
+        for condition in conditions:
+            if condition.img is not None:
+                img = Image.open(condition.img).convert("RGB")
+                embedding = encode_image(self.pipe_prior_redux, img)
+            elif condition.txt is not None:
+                embedding = encode_prompt(self.pipe_prior_redux, condition.txt)
+            else:
+                raise ValueError(f"txt and img both not set: {condition}")
+
+            embeddings_list.append(embedding)
+
+            length = embedding.size(1)
+            condition.start_index = current_index
+            current_index = current_index + length + 1
+            condition.end_index = current_index
+
+        # Concatenate embeddings along dim=1
+        prompt_embeds = torch.cat(embeddings_list, dim=1).to(DEVICE, dtype=WEIGHT_DTYPE)
+
+        # For pooled_prompt_embeds, use get_clip_empty
+        pooled_prompt_embeds = encode_clip_prompt(self.pipe_prior_redux, "")
+
+        # Build joint_attention_kwargs
+        joint_attention_kwargs = {"condition_reweightings": conditions}
+        return prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs
+
+
+def encode_image(pipe_prior_redux, img):
+    image_latents = pipe_prior_redux.encode_image(img, DEVICE, 1)
+    image_embeds = pipe_prior_redux.image_embedder(image_latents).image_embeds
+    return image_embeds
+
+
+def encode_prompt(pipe_prior_redux, prompt, max_sequence_length=512):
+    prompt_embeds = pipe_prior_redux._get_t5_prompt_embeds(prompt, 1, max_sequence_length, DEVICE)
+    return prompt_embeds
+
+
+def encode_clip_prompt(pipe_prior_redux, prompt):
+    pooled_prompt_embeds = pipe_prior_redux._get_clip_prompt_embeds(prompt, 1, DEVICE)
+    return pooled_prompt_embeds
+
+
+class SchnellPredictor(Predictor):
+    MODEL_URL = SCHNELL_URL
+    MODEL_CACHE = SCHNELL_CACHE
+
+
+class DevPredictor(Predictor):
+    MODEL_URL = DEV_URL
+    MODEL_CACHE = DEV_CACHE

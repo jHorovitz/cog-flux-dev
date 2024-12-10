@@ -6,9 +6,8 @@ build:
   cuda: "12.1"
   python_version: "3.11"
   python_packages:
-    - "torch>2.3"
     - "torchvision"
-    - "git+https://github.com/huggingface/diffusers.git@249a9e48e8f8aac4356d5a285c8ba0c600a80f64"
+    - "git+https://github.com/huggingface/diffusers.git@43534a8d1fd405fd0d1e74f991ab97f743bd3e59"
     - "transformers==4.43.3"
     - "accelerate==0.33.0"
     - "sentencepiece==0.2.0"
@@ -16,7 +15,12 @@ build:
     - "numpy==1.26.4"
     - "pillow==10.4.0"
 
+    - "https://download.pytorch.org/whl/nightly/cu124/torch-2.6.0.dev20240918%2Bcu124-cp311-cp311-linux_x86_64.whl"
+    - "https://download.pytorch.org/whl/nightly/cu124/torchaudio-2.5.0.dev20240918%2Bcu124-cp311-cp311-linux_x86_64.whl"
+    - "https://download.pytorch.org/whl/nightly/cu124/torchvision-0.20.0.dev20240918%2Bcu124-cp311-cp311-linux_x86_64.whl"
+    - "https://download.pytorch.org/whl/nightly/pytorch_triton-3.1.0%2B5fe38ffd73-cp311-cp311-linux_x86_64.whl"
+
   run:
     - curl -o /usr/local/bin/pget -L "https://github.com/replicate/pget/releases/latest/download/pget_$(uname -s)_$(uname -m)" && chmod +x /usr/local/bin/pget
 
-predict: "predict.py:Predictor"
+predict: "predict.py:DevPredictor"

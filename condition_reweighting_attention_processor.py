@@ -7,8 +7,6 @@ import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention
 from diffusers.models.embeddings import apply_rotary_emb
 
-from condition import Condition
-
 
 class ConditionReweightingAttentionProcessor:
     def __call__(
@@ -18,9 +16,7 @@ class ConditionReweightingAttentionProcessor:
         encoder_hidden_states: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
-        condition_reweightings: Optional[list[Condition]] = None,
-        block_index=None,
-        block_class=None,
+        conditions: list[tuple[int, int, float]] = None,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -72,11 +68,9 @@ class ConditionReweightingAttentionProcessor:
             query = apply_rotary_emb(query, image_rotary_emb)
             key = apply_rotary_emb(key, image_rotary_emb)
 
-        if condition_reweightings is not None:
-            condition_tuples = get_condition_tuples_for_block(condition_reweightings, block_index, block_class)
-            hidden_states = calculate_attention(query, key, value, condition_tuples)
-        else:
-            hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+        # BEGIN MODIFICATIONS
+        hidden_states = calculate_attention(query, key, value, conditions)
+        # END MODIFICATIONS
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -98,23 +92,13 @@ class ConditionReweightingAttentionProcessor:
             return hidden_states
 
 
-def get_condition_tuples_for_block(conditions, block_index, block_class):
-    condition_tuples = []
-    for condition in conditions:
-        weight = None
-        if block_class == "FluxTransformerBlock":
-            weight = condition.double_strengths[block_index]
-        elif block_class == "FluxSingleTransformerBlock":
-            weight = condition.single_strengths[block_index]
-        else:
-            raise ValueError(f"block_class not recognized: {block_class}")
+def calculate_attention(query, key, value, conditions) -> torch.Tensor:
+    """
+    Based on the scaled dot product attention implementation in PyTorch, but also
+    reweights according to conditions (start, end, weight) tuples and then re-normalizes.
 
-        condition_tuples.append((condition.start_index, condition.end_index, weight))
-    return condition_tuples
-
-
-def calculate_attention(query, key, value, condition_tuples) -> torch.Tensor:
-    # from https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    """
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
 
@@ -122,7 +106,7 @@ def calculate_attention(query, key, value, condition_tuples) -> torch.Tensor:
 
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_mask = torch.ones(L, S, dtype=query.dtype, device=query.device)
-    for start, end, weight in condition_tuples:
+    for start, end, weight in conditions:
         attn_mask[:, start:end] *= weight
     attn_weight *= attn_mask
     attn_weight = F.normalize(attn_weight, dim=-1, p=1)

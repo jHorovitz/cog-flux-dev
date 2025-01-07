@@ -2,4 +2,6 @@ model-cache
 __pycache__
 .cog
 FLUX.1-dev
+FLUX.1-schnell
+FLUX.1-Redux
 safety-cache

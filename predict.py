@@ -10,18 +10,13 @@ import numpy as np
 from PIL import Image
 from typing import List
 from diffusers import (
-    FluxPipeline,
     FluxPriorReduxPipeline,
 )
+from pipeline_flux_compile import FluxPipelineCompile
 from torchvision import transforms
-from transformers import CLIPImageProcessor
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 
-from condition import inputs_to_conditions
 from condition_reweighting_attention_processor import ConditionReweightingAttentionProcessor
-import monkey_patch
 
-MAX_IMAGE_SIZE = 1440
 DEV_CACHE = "./FLUX.1-dev"
 SCHNELL_CACHE = "./FLUX.1-schnell"
 DEV_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
@@ -29,20 +24,7 @@ SCHNELL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX
 REDUX_CACHE = "./FLUX.1-Redux"
 REDUX_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-Redux-dev/model.tar"
 
-ASPECT_RATIOS = {
-    "1:1_small": (512, 512),
-    "1:1": (1024, 1024),
-    "16:9": (1344, 768),
-    "21:9": (1536, 640),
-    "3:2": (1216, 832),
-    "2:3": (832, 1216),
-    "4:5": (896, 1088),
-    "5:4": (1088, 896),
-    "3:4": (896, 1152),
-    "4:3": (1152, 896),
-    "9:16": (768, 1344),
-    "9:21": (640, 1536),
-}
+MAX_SEQUENCE_LENGTH = 512
 
 
 def download_weights(url, dest):
@@ -64,24 +46,18 @@ class Predictor(BasePredictor):
 
         print("Loading Flux Pipeline")
         if not os.path.exists(self.MODEL_CACHE):
-            print(">>> flux weights do not exist")
             download_weights(self.MODEL_URL, ".")
-        else:
-            print(">>> flux weights exist: os.listdir(self.MODEL_CACHE)")
 
-        self.pipe = FluxPipeline.from_pretrained(
+        self.pipe = FluxPipelineCompile.from_pretrained(
             self.MODEL_CACHE,
             torch_dtype=WEIGHT_DTYPE,
             local_files_only=True,
         ).to("cuda")
-        monkey_patch.monkey_patch_pipeline(self.pipe)
         self.pipe.transformer.set_attn_processor(ConditionReweightingAttentionProcessor())
 
         if not os.path.exists(REDUX_CACHE):
-            print(">>> redux weights do not exist")
             download_weights(REDUX_URL, REDUX_CACHE)
-        else:
-            print(">>> redux weights exist: os.listdir(REDUX_CACHE)")
+
         self.pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             REDUX_CACHE,
             tokenizer=self.pipe.tokenizer,
@@ -90,10 +66,10 @@ class Predictor(BasePredictor):
             text_encoder_2=self.pipe.text_encoder_2,
             local_files_only=True,
         ).to(DEVICE)
-        print("setup took: ", time.time() - start)
 
-    def aspect_ratio_to_width_height(self, aspect_ratio: str) -> tuple[int, int]:
-        return ASPECT_RATIOS[aspect_ratio]
+        self.compile_flux()
+
+        print("setup took: ", time.time() - start)
 
     def get_image(self, image: str):
         image = Image.open(image).convert("RGB")
@@ -113,19 +89,19 @@ class Predictor(BasePredictor):
     @torch.inference_mode()
     def predict(
         self,
-        prompt: str = Input(description="First prompt for generated image", default=None),
-        prompt_2: str = Input(description="Second prompt for generated image", default=None),
+        prompt: str = Input(description="Text prompt", default=None),
         redux: Path = Input(
-            description="First Redux image.",
+            description="Redux image.",
             default=None,
         ),
-        redux_2: Path = Input(
-            description="Second Redux image.",
-            default=None,
+        redux_strength: float = Input(
+            description="Strength of the Redux image, values between 0.01 and 0.1 tend to have good results.",
+            default=0.05,
+            ge=0,
+            le=1,
         ),
-        aspect_ratio: str = Input(
-            description="Aspect ratio for the generated image", choices=list(ASPECT_RATIOS.keys()), default="1:1"
-        ),
+        width: int = Input(description="Width, in pixels", default=1024),
+        height: int = Input(description="Height, in pixels", default=1024),
         num_outputs: int = Input(
             description="Number of images to output.",
             ge=1,
@@ -156,14 +132,6 @@ class Predictor(BasePredictor):
             ge=0,
             le=100,
         ),
-        prompt_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
-        prompt_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
-        prompt_2_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
-        prompt_2_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
-        redux_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
-        redux_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
-        redux_2_single_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 38),
-        redux_2_double_strengths: str | list[float] = Input(description="Attention reweighting.", default=[1.0] * 19),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         if seed is None:
@@ -173,22 +141,8 @@ class Predictor(BasePredictor):
         generator = torch.Generator("cuda").manual_seed(seed)
 
         prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs = self.generate_embeddings(
-            prompt,
-            prompt_2,
-            redux,
-            redux_2,
-            prompt_single_strengths,
-            prompt_double_strengths,
-            prompt_2_single_strengths,
-            prompt_2_double_strengths,
-            redux_single_strengths,
-            redux_double_strengths,
-            redux_2_single_strengths,
-            redux_2_double_strengths,
+            prompt, redux, 1.0, redux_strength, num_outputs
         )
-
-        width, height = self.aspect_ratio_to_width_height(aspect_ratio)
-        max_sequence_length = 512
 
         flux_kwargs = {
             "width": width,
@@ -197,6 +151,7 @@ class Predictor(BasePredictor):
             "pooled_prompt_embeds": pooled_prompt_embeds,
             "joint_attention_kwargs": joint_attention_kwargs,
         }
+        max_sequence_length = MAX_SEQUENCE_LENGTH
         common_args = {
             "guidance_scale": guidance_scale,
             "generator": generator,
@@ -220,79 +175,39 @@ class Predictor(BasePredictor):
         return output_paths
 
     def generate_embeddings(
-        self,
-        prompt,
-        prompt_2,
-        redux,
-        redux_2,
-        prompt_single_strengths,
-        prompt_double_strengths,
-        prompt_2_single_strengths,
-        prompt_2_double_strengths,
-        redux_single_strengths,
-        redux_double_strengths,
-        redux_2_single_strengths,
-        redux_2_double_strengths,
+        self, prompt: str, redux: Path, prompt_strength: float, redux_strength: float, num_outputs: int
     ):
-        conditions = inputs_to_conditions(
-            prompt,
-            prompt_2,
-            redux,
-            redux_2,
-            prompt_single_strengths,
-            prompt_double_strengths,
-            prompt_2_single_strengths,
-            prompt_2_double_strengths,
-            redux_single_strengths,
-            redux_double_strengths,
-            redux_2_single_strengths,
-            redux_2_double_strengths,
-        )
+        txt_embedding = encode_prompt(self.pipe_prior_redux, prompt, num_outputs)
+        img = Image.open(redux).convert("RGB")
+        img_embedding = encode_image(self.pipe_prior_redux, img, num_outputs)
 
-        embeddings_list = []
-
-        current_index = 0
-        for condition in conditions:
-            if condition.img is not None:
-                img = Image.open(condition.img).convert("RGB")
-                embedding = encode_image(self.pipe_prior_redux, img)
-            elif condition.txt is not None:
-                embedding = encode_prompt(self.pipe_prior_redux, condition.txt)
-            else:
-                raise ValueError(f"txt and img both not set: {condition}")
-
-            embeddings_list.append(embedding)
-
-            length = embedding.size(1)
-            condition.start_index = current_index
-            current_index = current_index + length + 1
-            condition.end_index = current_index
+        prompt_condition = (0, txt_embedding.size(1), prompt_strength)
+        img_condition = (txt_embedding.size(1), txt_embedding.size(1) + img_embedding.size(1), redux_strength)
 
         # Concatenate embeddings along dim=1
-        prompt_embeds = torch.cat(embeddings_list, dim=1).to(DEVICE, dtype=WEIGHT_DTYPE)
+        prompt_embeds = torch.cat([txt_embedding, img_embedding], dim=1).to(DEVICE, dtype=WEIGHT_DTYPE)
 
         # For pooled_prompt_embeds, use get_clip_empty
-        pooled_prompt_embeds = encode_clip_prompt(self.pipe_prior_redux, "")
+        pooled_prompt_embeds = encode_clip_prompt(self.pipe_prior_redux, "", num_outputs)
 
         # Build joint_attention_kwargs
-        joint_attention_kwargs = {"condition_reweightings": conditions}
+        joint_attention_kwargs = {"conditions": [prompt_condition, img_condition]}
         return prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs
 
-
-def encode_image(pipe_prior_redux, img):
-    image_latents = pipe_prior_redux.encode_image(img, DEVICE, 1)
-    image_embeds = pipe_prior_redux.image_embedder(image_latents).image_embeds
-    return image_embeds
-
-
-def encode_prompt(pipe_prior_redux, prompt, max_sequence_length=512):
-    prompt_embeds = pipe_prior_redux._get_t5_prompt_embeds(prompt, 1, max_sequence_length, DEVICE)
-    return prompt_embeds
-
-
-def encode_clip_prompt(pipe_prior_redux, prompt):
-    pooled_prompt_embeds = pipe_prior_redux._get_clip_prompt_embeds(prompt, 1, DEVICE)
-    return pooled_prompt_embeds
+    def compile_flux(self):
+        start = time.time()
+        print("Compiling Flux Pipeline")
+        prompt = "test compilation prompt"
+        redux = Path("./girl.webp")
+        prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs = self.generate_embeddings(
+            prompt, redux, 1.0, 0.05, 1
+        )
+        self.pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            joint_attention_kwargs=joint_attention_kwargs,
+        )
+        print("Compilation took: ", time.time() - start)
 
 
 class SchnellPredictor(Predictor):
@@ -303,3 +218,19 @@ class SchnellPredictor(Predictor):
 class DevPredictor(Predictor):
     MODEL_URL = DEV_URL
     MODEL_CACHE = DEV_CACHE
+
+
+def encode_image(pipe_prior_redux, img, num_outputs):
+    image_latents = pipe_prior_redux.encode_image(img, DEVICE, 1)
+    image_embeds = pipe_prior_redux.image_embedder(image_latents).image_embeds
+    return image_embeds
+
+
+def encode_prompt(pipe_prior_redux, prompt, num_outputs, max_sequence_length=512):
+    prompt_embeds = pipe_prior_redux._get_t5_prompt_embeds(prompt, 1, max_sequence_length, DEVICE)
+    return prompt_embeds
+
+
+def encode_clip_prompt(pipe_prior_redux, prompt, num_outputs):
+    pooled_prompt_embeds = pipe_prior_redux._get_clip_prompt_embeds(prompt, 1, DEVICE)
+    return pooled_prompt_embeds

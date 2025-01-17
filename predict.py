@@ -9,20 +9,29 @@ import subprocess
 import numpy as np
 from PIL import Image
 from typing import List
-from diffusers import (
-    FluxPriorReduxPipeline,
-)
+from diffusers import FluxPriorReduxPipeline
 from pipeline_flux_compile import FluxPipelineCompile
+from pipeline_flux_control_compile import FluxControlPipelineCompile
 from torchvision import transforms
+from image_gen_aux import DepthPreprocessor
 
 from condition_reweighting_attention_processor import ConditionReweightingAttentionProcessor
 
-DEV_CACHE = "./FLUX.1-dev"
-SCHNELL_CACHE = "./FLUX.1-schnell"
+MODEL_CACHE_TOP_DIR = "./model-cache"  # necessary for tars that also contain a directory.
+DEV_CACHE = "./model-cache/FLUX.1-dev"
+SCHNELL_CACHE = "./model-cache/FLUX.1-schnell"
 DEV_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-dev/files.tar"
 SCHNELL_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-schnell/files.tar"
-REDUX_CACHE = "./FLUX.1-Redux"
+REDUX_CACHE = "./model-cache/FLUX.1-Redux"
 REDUX_URL = "https://weights.replicate.delivery/default/black-forest-labs/FLUX.1-Redux-dev/model.tar"
+DEPTH_PROCESSOR_CACHE = (
+    "./model-cache/models--LiheYoung--depth-anything-large-hf/snapshots/27ccb0920352c0c37b3a96441873c8d37bd52fb6"
+)
+DEPTH_PROCESSOR_URL = "https://weights.replicate.delivery/default/redux-slider/LiheYoung/depth-anything-large-hf.tar"
+DEPTH_LORA_CACHE = (
+    "./model-cache/models--black-forest-labs--FLUX.1-Depth-dev-lora/snapshots/ee9cc283d790a079d549ac0bf9ef7183082e3d90"
+)
+DEPTH_LORA_URL = "https://weights.replicate.delivery/default/redux-slider/black-forest-labs/FLUX.1-Depth-dev-lora.tar"
 
 MAX_SEQUENCE_LENGTH = 512
 
@@ -41,19 +50,42 @@ WEIGHT_DTYPE = torch.bfloat16
 
 class Predictor(BasePredictor):
     def setup(self) -> None:
+        """
+        Note: The reason that self.control_pipe and self.pipe are separate is that loading the
+        control lora actually changes the weights of the model (and not just the lora). Specifically,
+        pipe.transformer.x_embedder goes from being 64 to 128 in the input dimension.
+        """
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
 
         print("Loading Flux Pipeline")
         if not os.path.exists(self.MODEL_CACHE):
-            download_weights(self.MODEL_URL, ".")
+            download_weights(self.MODEL_URL, MODEL_CACHE_TOP_DIR)
 
         self.pipe = FluxPipelineCompile.from_pretrained(
             self.MODEL_CACHE,
             torch_dtype=WEIGHT_DTYPE,
             local_files_only=True,
-        ).to("cuda")
+        ).to(DEVICE)
         self.pipe.transformer.set_attn_processor(ConditionReweightingAttentionProcessor())
+
+        self.control_pipe = FluxControlPipelineCompile.from_pretrained(
+            self.MODEL_CACHE,
+            torch_dtype=WEIGHT_DTYPE,
+            local_files_only=True,
+        ).to(DEVICE)
+        self.control_pipe.transformer.set_attn_processor(ConditionReweightingAttentionProcessor())
+
+        if not os.path.exists(DEPTH_LORA_CACHE):
+            download_weights(DEPTH_LORA_URL, MODEL_CACHE_TOP_DIR)
+        self.control_pipe.load_lora_weights(
+            DEPTH_LORA_CACHE,
+            adapter_name="depth",
+            torch_dtype=WEIGHT_DTYPE,
+            local_files_only=True,
+            subfolder="snapshots/ee9cc283d790a079d549ac0bf9ef7183082e3d90",
+            weight_name="flux1-depth-dev-lora.safetensors",
+        )
 
         if not os.path.exists(REDUX_CACHE):
             download_weights(REDUX_URL, REDUX_CACHE)
@@ -66,6 +98,10 @@ class Predictor(BasePredictor):
             text_encoder_2=self.pipe.text_encoder_2,
             local_files_only=True,
         ).to(DEVICE)
+
+        if not os.path.exists(DEPTH_PROCESSOR_CACHE):
+            download_weights(DEPTH_PROCESSOR_URL, MODEL_CACHE_TOP_DIR)
+        self.depth_processor = DepthPreprocessor.from_pretrained(DEPTH_PROCESSOR_CACHE)
 
         self.compile_flux()
 
@@ -99,6 +135,10 @@ class Predictor(BasePredictor):
             default=0.05,
             ge=0,
             le=1,
+        ),
+        control_image: Path = Input(
+            description="Control image (optional).",
+            default=None,
         ),
         width: int = Input(description="Width, in pixels", default=1024),
         height: int = Input(description="Height, in pixels", default=1024),
@@ -144,6 +184,10 @@ class Predictor(BasePredictor):
             prompt, redux, 1.0, redux_strength, num_outputs
         )
 
+        if control_image is not None:
+            control_image = Image.open(control_image)
+            control_image = self.depth_processor(control_image)[0].convert("RGB")
+
         flux_kwargs = {
             "width": width,
             "height": height,
@@ -161,7 +205,10 @@ class Predictor(BasePredictor):
             "output_type": "pil",
         }
 
-        output = self.pipe(**common_args, **flux_kwargs)
+        if control_image is None:
+            output = self.pipe(**common_args, **flux_kwargs)
+        else:
+            output = self.control_pipe(**common_args, **flux_kwargs, control_image=control_image)
 
         output_paths = []
         for i, image in enumerate(output.images):
@@ -197,15 +244,32 @@ class Predictor(BasePredictor):
     def compile_flux(self):
         start = time.time()
         print("Compiling Flux Pipeline")
+        self.pipe.disable_lora()
         prompt = "test compilation prompt"
         redux = Path("./girl.webp")
+        control_image = Image.open(redux)
         prompt_embeds, pooled_prompt_embeds, joint_attention_kwargs = self.generate_embeddings(
-            prompt, redux, 1.0, 0.05, 1
+            prompt=prompt,
+            redux=redux,
+            prompt_strength=1.0,
+            redux_strength=0.05,
+            num_outputs=1,
         )
         self.pipe(
             prompt_embeds=prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             joint_attention_kwargs=joint_attention_kwargs,
+            height=256,
+            width=256,
+        )
+
+        self.control_pipe(
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            joint_attention_kwargs=joint_attention_kwargs,
+            control_image=control_image,
+            height=256,
+            width=256,
         )
         print("Compilation took: ", time.time() - start)
 

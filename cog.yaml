@@ -14,6 +14,8 @@ build:
     - "protobuf==5.27.3"
     - "numpy==1.26.4"
     - "pillow==10.4.0"
+    - "peft==0.14.0"
+    - "git+https://github.com/asomoza/image_gen_aux.git@b3ba07be8cba37f9ec2a5748ae5d86cc3879e228"
 
     - "https://download.pytorch.org/whl/nightly/cu124/torch-2.6.0.dev20240918%2Bcu124-cp311-cp311-linux_x86_64.whl"
     - "https://download.pytorch.org/whl/nightly/cu124/torchaudio-2.5.0.dev20240918%2Bcu124-cp311-cp311-linux_x86_64.whl"
